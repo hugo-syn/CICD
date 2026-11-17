@@ -5,8 +5,10 @@ on:
 
 jobs:
   say-hello:
-    runs-on: ubuntu-latest
+    runs-on: self-hosted
 
     steps:
       - name: Run a greeting script
         run: echo "Hello, World!"
+        env:
+          SECRET: ${{secrets.SECRET_REPO}}
