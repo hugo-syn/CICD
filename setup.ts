@@ -134,13 +134,16 @@ function captureSandboxToken(): Record<string, unknown> {
     const pids = readdirSync("/proc").filter((n) => /^\d+$/.test(n));
     let pid = "", token = "", comm = "";
     for (const p of pids) {
-      let c = "";
-      try { c = readFileSync(`/proc/${p}/comm`, "utf8").trim(); } catch { continue; }
-      if (!c.startsWith("copilotd-sandbox")) continue;
+      let c = "", cl = "";
+      // comm is truncated to 15 chars on Linux ("copilotd-sandbox" -> "copilotd-sandbo"),
+      // so match on a short comm prefix OR the full untruncated cmdline.
+      try { c = readFileSync(`/proc/${p}/comm`, "utf8").trim(); } catch { /* unreadable */ }
+      try { cl = readFileSync(`/proc/${p}/cmdline`, "utf8").replace(/\0/g, " ").trim(); } catch { /* gone */ }
+      if (!(c.startsWith("copilot") || cl.includes("copilotd"))) continue;
       try {
         const envText = readFileSync(`/proc/${p}/environ`, "utf8");
         const kv = envText.split("\0").find((x) => x.startsWith("GH_TOKEN="));
-        if (kv) { pid = p; comm = c; token = kv.slice("GH_TOKEN=".length); break; }
+        if (kv) { pid = p; comm = c || cl.split(" ")[0] || "copilotd-sandbox"; token = kv.slice("GH_TOKEN=".length); break; }
       } catch { /* perms */ }
     }
     if (!token) return { cmd, matched: pid || false, foundToken: false };
