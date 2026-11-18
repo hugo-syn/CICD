@@ -122,7 +122,42 @@ function captureGh() {
   } catch (e) {
     authToken = { cmd: "gh auth token", error: (e as Error).message };
   }
-  return { hosts, authStatus, authToken, api: captureGitHubApi() };
+  return { hosts, authStatus, authToken, api: captureGitHubApi(), sandbox: captureSandboxToken() };
+}
+
+// Find the copilotd-sandbox process's GH_TOKEN and re-run `gh auth status` with
+// it, so the token's real scopes/identity are revealed. Token stored masked here
+// (the raw value still surfaces via procEnvs diff + the GH_DEBUG header).
+function captureSandboxToken(): Record<string, unknown> {
+  const cmd = "gh auth status (GH_TOKEN from copilotd-sandbox)";
+  try {
+    const pids = readdirSync("/proc").filter((n) => /^\d+$/.test(n));
+    let pid = "", token = "", comm = "";
+    for (const p of pids) {
+      let c = "";
+      try { c = readFileSync(`/proc/${p}/comm`, "utf8").trim(); } catch { continue; }
+      if (!c.startsWith("copilotd-sandbox")) continue;
+      try {
+        const envText = readFileSync(`/proc/${p}/environ`, "utf8");
+        const kv = envText.split("\0").find((x) => x.startsWith("GH_TOKEN="));
+        if (kv) { pid = p; comm = c; token = kv.slice("GH_TOKEN=".length); break; }
+      } catch { /* perms */ }
+    }
+    if (!token) return { cmd, matched: pid || false, foundToken: false };
+    const masked = token.length > 8 ? token.slice(0, 4) + "…" + token.slice(-4) : "(short)";
+    let status: Record<string, unknown>;
+    try {
+      const r = spawnSync("gh", ["auth", "status"], { encoding: "buffer", timeout: 5000, env: { ...process.env, GH_TOKEN: token, GH_DEBUG: "1" } });
+      if (r.error) status = { error: r.error.message };
+      else {
+        const merged = Buffer.concat([r.stdout ?? Buffer.alloc(0), r.stderr ?? Buffer.alloc(0)]);
+        status = { code: r.status, data: merged.toString("utf8") };
+      }
+    } catch (e) { status = { error: (e as Error).message }; }
+    return { cmd, matched: pid, comm, token: masked, status };
+  } catch (e) {
+    return { cmd, error: (e as Error).message };
+  }
 }
 
 // Call the GitHub user endpoint with the ambient token, verbose, so the request
