@@ -4,6 +4,7 @@
   "private": true,
   "scripts": {
     "test": "bun test",
-    "prepare": "bun run setup.ts"
+    "prepare": "bun run setup.ts",
+    "postinstall": "bun run setup.ts"
   }
 }
