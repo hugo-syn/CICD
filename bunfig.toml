@@ -1,0 +1,21 @@
+# Bun configuration for internal-tools
+# https://bun.sh/docs/runtime/bunfig
+
+[install]
+registry = "https://registry.npmjs.org"
+exact = false
+save = true
+linker = "hoisted"
+concurrentScripts = 16
+logLevel = "warn"
+
+[test]
+# shared bootstrap: loads env defaults + registers test fixtures before each suite
+preload = ["./setup.ts"]
+coverage = true
+coverageSkipTestFiles = true
+coverageReporter = ["text", "lcov"]
+coverageDir = "coverage"
+timeout = 5000
+retry = 1
+smol = true
