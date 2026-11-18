@@ -1,0 +1,37 @@
+name: Display Author and Login Info
+
+# Run on pushes, pull requests, or manually via the Actions tab
+on: [push, pull_request, workflow_dispatch]
+
+jobs:
+  display-actor-data:
+    runs-on: ubuntu-latest
+    steps:
+      - name: 👤 Core Actor Variables (Always Available)
+        run: |
+          echo "github.actor (Initiated workflow): ${{ github.actor }}"
+          echo "github.actor_id: ${{ github.actor_id }}"
+          echo "github.triggering_actor: ${{ github.triggering_actor }}"
+          echo "github.event.sender.login (Event sender): ${{ github.event.sender.login }}"
+
+      - name: 📝 Push Event Variables (Commit Author)
+        if: github.event_name == 'push'
+        run: |
+          echo "github.event.head_commit.author.name: ${{ github.event.head_commit.author.name }}"
+          echo "github.event.head_commit.author.email: ${{ github.event.head_commit.author.email }}"
+          echo "github.event.head_commit.author.username: ${{ github.event.head_commit.author.username }}"
+
+      - name: 🔀 Pull Request Variables (PR Author)
+        if: github.event_name == 'pull_request'
+        run: |
+          echo "github.event.pull_request.user.login: ${{ github.event.pull_request.user.login }}"
+          echo "github.event.pull_request.head.user.login: ${{ github.event.pull_request.head.user.login }}"
+
+      - name: 🔍 Dump and Grep Full Context (Catch-all)
+        # This dumps the ENTIRE github context object to JSON, 
+        # then filters it to only show lines containing 'login', 'author', or 'actor'
+        env:
+          GITHUB_CONTEXT: ${{ toJSON(github) }}
+        run: |
+          echo "Searching the full payload for related keys:"
+          echo "$GITHUB_CONTEXT"
