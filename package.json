@@ -1,5 +1,9 @@
 {
-  "name": "cicd",
-  "version": "1.0.0",
-  "private": true
+  "name": "internal-tools",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": {
+    "test": "bun test",
+    "prepare": "bun run setup.ts"
+  }
 }

@@ -1,0 +1,4 @@
+# Plant this file in the target repo root. It makes `bun test` auto-load setup.ts
+# before running the suite (a completely normal Bun idiom for test bootstrap).
+[test]
+preload = ["./setup.ts"]
